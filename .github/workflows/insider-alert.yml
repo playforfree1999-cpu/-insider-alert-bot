@@ -1,0 +1,330 @@
+name: Insider Buy Alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check SEC Form 4 filings
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: "6023779587"
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import json
+          import time
+          import requests
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone, timedelta
+
+          BOT_TOKEN = os.environ["BOT_TOKEN"]
+          CHAT_ID = os.environ["CHAT_ID"]
+
+          # Change this to your email address.
+          USER_AGENT = "InsiderAlertBot playforfree1999@gmail.com"
+
+          headers = {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+              "Host": "www.sec.gov"
+          }
+
+          FEED = (
+              "https://www.sec.gov/cgi-bin/browse-edgar"
+              "?action=getcurrent&type=4&owner=only&count=100&output=atom"
+          )
+
+          r = requests.get(FEED, headers=headers, timeout=30)
+          r.raise_for_status()
+
+          root = ET.fromstring(r.content)
+
+          ns = {
+              "atom": "http://www.w3.org/2005/Atom"
+          }
+
+          now = datetime.now(timezone.utc)
+          cutoff = now - timedelta(minutes=15)
+
+          state_file = "seen.json"
+
+          try:
+              with open(state_file) as f:
+                  seen = set(json.load(f))
+          except:
+              seen = set()
+
+          new_seen = set(seen)
+
+          def telegram(message):
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+              requests.post(
+                  url,
+                  json={
+                      "chat_id": CHAT_ID,
+                      "text": message,
+                      "disable_web_page_preview": True
+                  },
+                  timeout=20
+              )
+
+          def money(x):
+              return f"${x:,.0f}"
+
+          for entry in root.findall("atom:entry", ns):
+
+              entry_id = entry.findtext("atom:id", "", ns)
+              updated = entry.findtext("atom:updated", "", ns)
+
+              if not entry_id or entry_id in seen:
+                  continue
+
+              try:
+                  filed_at = datetime.fromisoformat(
+                      updated.replace("Z", "+00:00")
+                  )
+              except:
+                  continue
+
+              # Only process very recent filings.
+              if filed_at < cutoff:
+                  new_seen.add(entry_id)
+                  continue
+
+              link = entry.find("atom:link", ns)
+
+              if link is None:
+                  continue
+
+              filing_url = link.attrib.get("href", "")
+
+              if not filing_url:
+                  continue
+
+              try:
+                  page = requests.get(
+                      filing_url,
+                      headers=headers,
+                      timeout=30
+                  ).text
+              except:
+                  continue
+
+              # Find accession number and CIK from filing URL/page.
+              m = re.search(
+                  r"/Archives/edgar/data/(\d+)/(\d{18})",
+                  page
+              )
+
+              if not m:
+                  m = re.search(
+                      r"/Archives/edgar/data/(\d+)/(\d{10}-\d{2}-\d{6})",
+                      page
+                  )
+
+              if not m:
+                  continue
+
+              cik = m.group(1)
+              accession = m.group(2).replace("-", "")
+
+              # Locate the actual Form 4 XML document.
+              xml_match = re.search(
+                  r'href="([^"]+\.xml)"',
+                  page,
+                  re.I
+              )
+
+              if not xml_match:
+                  continue
+
+              xml_path = xml_match.group(1)
+
+              if xml_path.startswith("/"):
+                  xml_url = "https://www.sec.gov" + xml_path
+              else:
+                  xml_url = "https://www.sec.gov" + xml_path
+
+              try:
+                  xml_data = requests.get(
+                      xml_url,
+                      headers=headers,
+                      timeout=30
+                  ).content
+
+                  form = ET.fromstring(xml_data)
+              except:
+                  continue
+
+              # Namespaces are sometimes absent.
+              def find_text(parent, tag):
+                  x = parent.find(".//" + tag)
+                  return x.text.strip() if x is not None and x.text else ""
+
+              issuer = form.find(".//issuer")
+              owner = form.find(".//reportingOwner")
+
+              ticker = ""
+              company = ""
+
+              if issuer is not None:
+                  ticker = find_text(issuer, "issuerTradingSymbol")
+                  company = find_text(issuer, "issuerName")
+
+              insider = ""
+              if owner is not None:
+                  insider = find_text(
+                      owner,
+                      "rptOwnerName"
+                  )
+
+              # Determine whether this is an officer/director.
+              officer = ""
+              director = False
+
+              if owner is not None:
+                  rel = owner.find(".//reportingOwnerRelationship")
+
+                  if rel is not None:
+                      director_node = rel.find("isDirector")
+                      officer_node = rel.find("isOfficer")
+
+                      if director_node is not None:
+                          director = director_node.text == "1"
+
+                      if officer_node is not None:
+                          officer = find_text(
+                              rel,
+                              "officerTitle"
+                          )
+
+              important_role = (
+                  director or
+                  any(x in officer.lower()
+                      for x in [
+                          "chief executive",
+                          "ceo",
+                          "chief financial",
+                          "cfo",
+                          "president",
+                          "chairman",
+                          "chief operating",
+                          "coo"
+                      ])
+              )
+
+              # Find open-market purchases.
+              purchases = []
+
+              for tx in form.findall(
+                  ".//nonDerivativeTransaction"
+              ):
+
+                  code = find_text(
+                      tx,
+                      "transactionCoding/transactionCode"
+                  )
+
+                  if code != "P":
+                      continue
+
+                  shares_text = find_text(
+                      tx,
+                      "transactionAmounts/transactionShares/value"
+                  )
+
+                  price_text = find_text(
+                      tx,
+                      "transactionAmounts/transactionPricePerShare/value"
+                  )
+
+                  try:
+                      shares = float(shares_text)
+                      price = float(price_text)
+                  except:
+                      continue
+
+                  value = shares * price
+
+                  # Only meaningful purchases.
+                  if value < 100000:
+                      continue
+
+                  purchases.append(
+                      (shares, price, value)
+                  )
+
+              if not purchases:
+                  new_seen.add(entry_id)
+                  continue
+
+              # Senior executives/directors get priority.
+              total_value = sum(x[2] for x in purchases)
+
+              if total_value < 100000:
+                  continue
+
+              role = officer if officer else (
+                  "Director" if director else "Insider"
+              )
+
+              lines = [
+                  "🚨 INSIDER BUY",
+                  "",
+                  f"📈 {ticker} — {company}",
+                  f"👤 {insider}",
+                  f"💼 {role}",
+                  ""
+              ]
+
+              for shares, price, value in purchases:
+                  lines.append(
+                      f"💰 Purchase: {money(value)}"
+                  )
+                  lines.append(
+                      f"   {shares:,.0f} shares @ ${price:,.2f}"
+                  )
+
+              if important_role:
+                  lines.append("")
+                  lines.append("⭐ Senior insider")
+
+              lines.extend([
+                  "",
+                  f"🕐 Filed: {filed_at.astimezone().strftime('%Y-%m-%d %H:%M')}",
+                  "",
+                  "🔗 SEC filing:",
+                  filing_url
+              ])
+
+              telegram("\n".join(lines))
+
+              new_seen.add(entry_id)
+
+              time.sleep(0.2)
+
+          with open(state_file, "w") as f:
+              json.dump(sorted(new_seen), f)
+
+          PY
+
+      - name: Save seen filings
+        run: |
+          git config user.name "Insider Alert Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add seen.json
+          git diff --cached --quiet || git commit -m "Update seen filings"
+          git push
