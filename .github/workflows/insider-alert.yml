@@ -11,9 +11,8 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-
-    steps:
-      -name: Test Telegram
+        steps:
+      - name: Test Telegram
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
@@ -46,6 +45,10 @@ jobs:
           if not result.get("ok"):
               raise SystemExit("Telegram API rejected the request")
           PY
+
+      - name: Checkout
+        uses: actions/checkout@v4
+  
       - name: Checkout
         uses: actions/checkout@v4
 
