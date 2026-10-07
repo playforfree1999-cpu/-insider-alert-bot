@@ -13,13 +13,39 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Telegram
+      -       - name: Test Telegram
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            -d chat_id="6023779587" \
-            --data-urlencode "text=✅ Insider Alert Bot test — Telegram connection works!"
+          python - <<'PY'
+          import os
+          import urllib.request
+          import urllib.parse
+          import json
+
+          token = os.environ["BOT_TOKEN"]
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          data = urllib.parse.urlencode({
+              "chat_id": "6023779587",
+              "text": "✅ Insider Alert Bot test — Telegram connection works!"
+          }).encode()
+
+          request = urllib.request.Request(
+              url,
+              data=data,
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request, timeout=20) as response:
+              result = json.loads(response.read().decode())
+
+          print(result)
+
+          if not result.get("ok"):
+              raise SystemExit("Telegram API rejected the request")
+          PY
       - name: Checkout
         uses: actions/checkout@v4
 
