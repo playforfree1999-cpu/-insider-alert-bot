@@ -1,0 +1,449 @@
+name: Insider Buy Alerts
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_telegram:
+        description: "Send a Telegram test message"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test Telegram
+        if: ${{ inputs.test_telegram == true }}
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+
+          token = os.environ["BOT_TOKEN"]
+
+          if not token:
+              raise SystemExit("TELEGRAM_BOT_TOKEN secret is missing")
+
+          url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+          data = urllib.parse.urlencode({
+              "chat_id": "6023779587",
+              "text": "✅ Insider Alert Bot test — Telegram connection works!"
+          }).encode()
+
+          request = urllib.request.Request(
+              url,
+              data=data,
+              method="POST"
+          )
+
+          with urllib.request.urlopen(request, timeout=20) as response:
+              result = json.loads(response.read().decode())
+
+          print(result)
+
+          if not result.get("ok"):
+              raise SystemExit(
+                  "Telegram rejected the request: "
+                  + str(result)
+              )
+          PY
+
+      - name: Check SEC Form 4 filings
+        if: ${{ inputs.test_telegram != true }}
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import json
+          import time
+          import requests
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone, timedelta
+
+          BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+          USER_AGENT = "InsiderAlertBot playforfree1999@gmail.com"
+
+          SEC_HEADERS = {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+              "Host": "www.sec.gov"
+          }
+
+          FEED_URL = (
+              "https://www.sec.gov/cgi-bin/browse-edgar"
+              "?action=getcurrent"
+              "&type=4"
+              "&owner=only"
+              "&count=100"
+              "&output=atom"
+          )
+
+          MINIMUM_PURCHASE = 100000
+
+          def telegram(message):
+              url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+              data = {
+                  "chat_id": "6023779587",
+                  "text": message,
+                  "disable_web_page_preview": True
+              }
+
+              response = requests.post(
+                  url,
+                  data=data,
+                  timeout=20
+              )
+
+              result = response.json()
+
+              if not result.get("ok"):
+                  print("Telegram error:", result)
+              else:
+                  print("Telegram message sent.")
+
+          def text(parent, path):
+              node = parent.find(path)
+
+              if node is None or node.text is None:
+                  return ""
+
+              return node.text.strip()
+
+          def number(value):
+              try:
+                  return float(value)
+              except:
+                  return 0.0
+
+          print("Checking SEC Form 4 filings...")
+
+          response = requests.get(
+              FEED_URL,
+              headers=SEC_HEADERS,
+              timeout=30
+          )
+
+          response.raise_for_status()
+
+          root = ET.fromstring(response.content)
+
+          ATOM = {
+              "atom": "http://www.w3.org/2005/Atom"
+          }
+
+          now = datetime.now(timezone.utc)
+
+          cutoff = now - timedelta(minutes=15)
+
+          for entry in root.findall("atom:entry", ATOM):
+
+              entry_id = text(
+                  entry,
+                  "atom:id"
+              )
+
+              updated_text = text(
+                  entry,
+                  "atom:updated"
+              )
+
+              if not entry_id:
+                  continue
+
+              try:
+                  updated = datetime.fromisoformat(
+                      updated_text.replace("Z", "+00:00")
+                  )
+              except:
+                  continue
+
+              if updated < cutoff:
+                  continue
+
+              links = entry.findall(
+                  "atom:link",
+                  ATOM
+              )
+
+              filing_url = ""
+
+              for link in links:
+                  href = link.attrib.get("href", "")
+
+                  if href:
+                      filing_url = href
+                      break
+
+              if not filing_url:
+                  continue
+
+              print("New filing:", filing_url)
+
+              try:
+                  filing_page = requests.get(
+                      filing_url,
+                      headers=SEC_HEADERS,
+                      timeout=30
+                  ).text
+              except Exception as e:
+                  print("Could not read filing:", e)
+                  continue
+
+              xml_matches = re.findall(
+                  r'href="([^"]+\.xml)"',
+                  filing_page,
+                  re.IGNORECASE
+              )
+
+              if not xml_matches:
+                  print("No XML document found.")
+                  continue
+
+              xml_url = xml_matches[0]
+
+              if xml_url.startswith("/"):
+                  xml_url = "https://www.sec.gov" + xml_url
+              elif not xml_url.startswith("http"):
+                  xml_url = "https://www.sec.gov/" + xml_url
+
+              try:
+                  xml_response = requests.get(
+                      xml_url,
+                      headers=SEC_HEADERS,
+                      timeout=30
+                  )
+
+                  form = ET.fromstring(
+                      xml_response.content
+                  )
+
+              except Exception as e:
+                  print("Could not parse Form 4:", e)
+                  continue
+
+              issuer = form.find(".//issuer")
+
+              if issuer is None:
+                  continue
+
+              ticker = text(
+                  issuer,
+                  "issuerTradingSymbol"
+              )
+
+              company = text(
+                  issuer,
+                  "issuerName"
+              )
+
+              owner = form.find(
+                  ".//reportingOwner"
+              )
+
+              if owner is None:
+                  continue
+
+              insider = text(
+                  owner,
+                  "rptOwnerName"
+              )
+
+              relationship = owner.find(
+                  ".//reportingOwnerRelationship"
+              )
+
+              officer_title = ""
+
+              is_director = False
+
+              if relationship is not None:
+
+                  officer_title = text(
+                      relationship,
+                      "officerTitle"
+                  )
+
+                  director_value = text(
+                      relationship,
+                      "isDirector"
+                  )
+
+                  is_director = (
+                      director_value == "1"
+                  )
+
+              role = officer_title
+
+              if not role and is_director:
+                  role = "Director"
+
+              if not role:
+                  role = "Insider"
+
+              purchases = []
+
+              for transaction in form.findall(
+                  ".//nonDerivativeTransaction"
+              ):
+
+                  code = text(
+                      transaction,
+                      "transactionCoding/transactionCode"
+                  )
+
+                  if code != "P":
+                      continue
+
+                  shares = number(
+                      text(
+                          transaction,
+                          "transactionAmounts/"
+                          "transactionShares/value"
+                      )
+                  )
+
+                  price = number(
+                      text(
+                          transaction,
+                          "transactionAmounts/"
+                          "transactionPricePerShare/value"
+                      )
+                  )
+
+                  value = shares * price
+
+                  if value < MINIMUM_PURCHASE:
+                      continue
+
+                  purchases.append(
+                      {
+                          "shares": shares,
+                          "price": price,
+                          "value": value
+                      }
+                  )
+
+              if not purchases:
+                  continue
+
+              total_value = sum(
+                  purchase["value"]
+                  for purchase in purchases
+              )
+
+              if total_value < MINIMUM_PURCHASE:
+                  continue
+
+              is_senior = any(
+                  keyword in role.lower()
+                  for keyword in [
+                      "chief executive",
+                      "ceo",
+                      "chief financial",
+                      "cfo",
+                      "president",
+                      "chairman",
+                      "chief operating",
+                      "coo"
+                  ]
+              ) or is_director
+
+              # Look for a 10b5-1 indicator.
+              xml_text = xml_response.text.lower()
+
+              has_10b5_1 = (
+                  "aff10b5one" in xml_text
+                  or "10b5-1" in xml_text
+                  or "10b5–1" in xml_text
+              )
+
+              if has_10b5_1:
+                  print(
+                      f"Skipping {ticker}: "
+                      "possible 10b5-1 transaction"
+                  )
+                  continue
+
+              message = []
+
+              message.append(
+                  "🚨 INSIDER BUY"
+              )
+
+              message.append("")
+
+              message.append(
+                  f"📈 {ticker} — {company}"
+              )
+
+              message.append(
+                  f"👤 {insider}"
+              )
+
+              message.append(
+                  f"💼 {role}"
+              )
+
+              message.append("")
+
+              for purchase in purchases:
+
+                  message.append(
+                      f"💰 ${purchase['value']:,.0f}"
+                  )
+
+                  message.append(
+                      f"   "
+                      f"{purchase['shares']:,.0f} shares "
+                      f"@ ${purchase['price']:,.2f}"
+                  )
+
+              message.append("")
+
+              if is_senior:
+                  message.append(
+                      "⭐ Senior insider/director"
+                  )
+
+              message.append(
+                  f"🕐 Filed: "
+                  f"{updated.astimezone().strftime('%Y-%m-%d %H:%M')}"
+              )
+
+              message.append("")
+
+              message.append(
+                  "🔗 SEC filing:"
+              )
+
+              message.append(
+                  filing_url
+              )
+
+              telegram(
+                  "\n".join(message)
+              )
+
+              time.sleep(0.3)
+
+          print("Finished.")
+          PY
