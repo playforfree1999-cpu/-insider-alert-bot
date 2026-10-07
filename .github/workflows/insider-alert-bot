@@ -1,4 +1,4 @@
-name: Insider Buy Alerts
+name: insider-alert.yml
 
 on:
   schedule:
